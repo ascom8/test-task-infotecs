@@ -9,8 +9,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <chrono>
-#include <stdio.h>
-#include <errno.h>
+#include <atomic>
 
 #define PORT 8080
 
@@ -23,17 +22,40 @@ bool handleConnection(int& client_socket, int server_fd) {
             return true;
         }
         else {
+            perror("Accept failed");
             std::cout << "Waiting for client to reconnect...\n";
-            std::this_thread::sleep_for(std::chrono::seconds(2)); // Задержка перед повторной попыткой
+            std::this_thread::sleep_for(std::chrono::seconds(2));
         }
     }
 }
 
+// Проверка состояния сокета
+bool isClientConnected(int client_socket) {
+    if (client_socket == -1) {
+        return false;
+    }
+
+    char buffer;
+    ssize_t result = recv(client_socket, &buffer, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (result == 0) {
+        // Клиент закрыл соединение
+        std::cerr << "Client disconnected.\n";
+        close(client_socket);
+        return false;
+    }
+    else if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        perror("Error checking client connection");
+        return false;
+    }
+
+    return true;
+}
+
 // Функция отправки строки клиенту
-void sendToClient(int& client_socket, const std::string& buffer) {
+bool sendToClient(int& client_socket, const std::string& buffer) {
     if (client_socket == -1) {
         std::cerr << "Invalid socket. Reconnecting...\n";
-        return;  // Если сокет недействителен, прекращаем отправку
+        return false;
     }
 
     size_t totalSent = 0;
@@ -41,37 +63,39 @@ void sendToClient(int& client_socket, const std::string& buffer) {
         ssize_t sentBytes = send(client_socket, buffer.c_str() + totalSent, buffer.size() - totalSent, 0);
         if (sentBytes == -1) {
             if (errno == ECONNRESET || errno == EPIPE) {
-                std::cerr << "Client disconnected. Attempting to reconnect...\n";
+                std::cerr << "Client disconnected.\n";
                 close(client_socket);
-                client_socket = -1; // Обнуляем сокет
-                return;  // Завершаем передачу, если клиент отключился
+                client_socket = -1;
+                return false;
             }
             else {
                 perror("Send failed");
-                return;
+                return false;
             }
         }
         totalSent += sentBytes;
     }
     std::cout << "Data sent successfully: " << buffer << std::endl;
+    return true;
 }
 
 // Функция обработки данных от клиента
 void handleClient(int& client_socket, int server_fd) {
     std::mutex buffer_mutex;
     std::condition_variable cv;
-    bool bufferReady = false;
+    std::atomic<bool> bufferReady(false);
 
     while (true) {
         std::string inputStr;
         std::cout << "Enter a string: ";
         std::getline(std::cin, inputStr);
 
-        if (client_socket == -1) {
+        // Проверяем состояние подключения
+        if (client_socket == -1 || !isClientConnected(client_socket)) {
             std::cerr << "No client connected, waiting for connection...\n";
             if (!handleConnection(client_socket, server_fd)) {
                 std::cerr << "Failed to reconnect to client.\n";
-                return;
+                continue;
             }
         }
 
@@ -86,22 +110,33 @@ void handleClient(int& client_socket, int server_fd) {
                 bufferReady = true;
             }
             cv.notify_one();
-        });
+            });
 
         // Поток отправки строки клиенту
-        std::thread th2([&str, &buffer, &buffer_mutex, &cv, &bufferReady, &client_socket]() {
+        std::thread th2([&buffer, &buffer_mutex, &cv, &bufferReady, &client_socket]() {
             std::unique_lock<std::mutex> lock(buffer_mutex);
-            cv.wait(lock, [&bufferReady]() { return bufferReady; });
-            sendToClient(client_socket, buffer);
+            cv.wait(lock, [&bufferReady]() { return bufferReady.load(); });
 
-            // Сброс состояния готовности буфера
+            if (client_socket != -1 && isClientConnected(client_socket)) {
+                if (!sendToClient(client_socket, buffer)) {
+                    std::cerr << "Failed to send data to client. Skipping...\n";
+                }
+            }
+            else {
+                std::cerr << "Client is not connected. Skipping send step.\n";
+            }
+
             bufferReady = false;
-            str.clearBuffer(buffer);
-        });
+            buffer.clear();
+            });
 
-        // Ожидание завершения потоков
         th1.join();
         th2.join();
+
+        if (client_socket == -1 || !isClientConnected(client_socket)) {
+            std::cerr << "Client disconnected, waiting for reconnection...\n";
+            return;
+        }
     }
 }
 
@@ -123,19 +158,16 @@ int main() {
         return 1;
     }
 
-    // Настройка адреса сервера
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
 
-    // Привязка сокета к адресу и порту
     if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
         perror("Bind failed");
         close(server_fd);
         return 1;
     }
 
-    // Переход в режим ожидания входящих подключений
     if (listen(server_fd, 3) == -1) {
         perror("Listen failed");
         close(server_fd);
@@ -145,13 +177,18 @@ int main() {
     std::cout << "Server is running and waiting for connections on port " << PORT << "...\n";
 
     while (true) {
-        // Ожидаем подключение клиента, если его нет
-        if (client_socket == -1 && !handleConnection(client_socket, server_fd)) {
-            std::cerr << "Failed to reconnect to client.\n";
-            continue;
+        if (client_socket == -1) {
+            handleConnection(client_socket, server_fd);
         }
 
-        handleClient(client_socket, server_fd);  // Работа с клиентом
+        try {
+            handleClient(client_socket, server_fd);
+        }
+        catch (const std::exception& e) {
+            std::cerr << "Error handling client: " << e.what() << "\n";
+            close(client_socket);
+            client_socket = -1;
+        }
     }
 
     close(client_socket);

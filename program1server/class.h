@@ -14,7 +14,6 @@ public:
 
 	bool checkString();
 	void processingString(std::string& buffer);
-	void clearBuffer(std::string& buffer);
 
 private:
 	std::string str;

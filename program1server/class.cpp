@@ -28,7 +28,3 @@ void String::processingString(std::string& buffer) {
 		}
 	}
 }
-
-void String::clearBuffer(std::string& buffer) {
-	buffer.clear();
-}
